@@ -13,13 +13,15 @@ from fvcore.nn import FlopCountAnalysis
 from lib.data import get_dataset_ft
 from lib.utils import accuracy, AverageMeter
 
+import code
+
 def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
     return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
                      padding=dilation, groups=groups, bias=False, dilation=dilation)
 
 
 class PrunedBasicBlock(nn.Module):
-    def __init__(self, inplanes, midplanes, outplanes, norm_layer=None):
+    def __init__(self, inplanes, midplanes, outplanes, norm_layer=None,  weight_model=None,  indexer=None):
         super().__init__()
         if norm_layer is None:
             norm_layer = nn.BatchNorm2d
@@ -28,6 +30,16 @@ class PrunedBasicBlock(nn.Module):
         self.relu = nn.ReLU(inplace=True)
         self.conv2 = conv3x3(midplanes, outplanes)
         self.bn2 = norm_layer(outplanes)
+
+        if weight_model is not None and indexer is not None:
+            self.conv1.weight.data = weight_model.conv1.weight.data[indexer, :]
+            self.bn1.weight.data = weight_model.bn1.weight.data[indexer]
+            self.bn1.bias.data = weight_model.bn1.bias.data[indexer]
+            # self.bn1.running_mean.data = weight_model.bn1.running_mean.data[indexer]
+            # self.bn1.running_var.data = weight_model.bn1.running_var.data[indexer]
+            self.conv2.weight.data = weight_model.conv2.weight.data[:, indexer, :]
+            self.bn2.weight.data = weight_model.bn2.weight.data
+            self.bn2.bias.data = weight_model.bn2.bias.data 
 
     def forward(self, x):
         identity = x
@@ -77,11 +89,12 @@ def residual_objective(mat):
     return 0.5 * torch.sum(mat**2)
 
 
-def prune_basic_block(input_data, og_block, ratio=0.5, num_iter=20, bs=128, verbose=False):
+def prune_basic_block(args, input_data, og_block, ratio=0.5, num_iter=20, bs=128, verbose=False):
     if verbose:
         print(f'\nPruning Settings: ratio {ratio}, iters {num_iter}, data ex {input_data.shape[0]}')
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     og_block = og_block.to(device)
+    og_block_sync = copy.deepcopy(og_block)
 
     # compute size of pruned block and create it
     in_channels = og_block.conv1.in_channels
@@ -93,6 +106,7 @@ def prune_basic_block(input_data, og_block, ratio=0.5, num_iter=20, bs=128, verb
 
     # compute dense hidden representation
     og_hidden = []
+    og_final = []
     for i in range(0, input_data.shape[0], bs):
         mb_input = input_data[i: i + bs, :]
         mb_input = mb_input.to(device)
@@ -101,34 +115,41 @@ def prune_basic_block(input_data, og_block, ratio=0.5, num_iter=20, bs=128, verb
             mb_hid = og_block.bn1(mb_hid)
             mb_hid = og_block.relu(mb_hid)
             og_hidden.append(mb_hid.cpu())
+            og_output = og_block.conv2(mb_hid)
+            og_output = og_block.bn2(og_output)
+            og_final.append(og_output.cpu())
     with torch.no_grad():
         og_hidden = torch.cat(og_hidden, dim=0)
-        agg_hidden = torch.sum(og_hidden, dim=(0, 2, 3))
+        og_final = torch.cat(og_final, dim=0)
 
     # main pruning loop
     pruned_indices = set([])
     pruned_indexer = None
-    for t in range(num_iter):
+    for _ in range(num_iter):
         # compute importance with automatic differentiation (chunked into mini-batches)
         importance = None
         for i in range(0, og_hidden.shape[0], bs):
             mb_hid = og_hidden[i:i + bs, :]
             mb_hid = mb_hid.to(device)
-            mb_hid.requires_grad = True # track gradient on layer input to determine importance
+            pruned_block.conv2.weight.requires_grad = True # track gradient on layer input to determine importance
             og_output = og_block.conv2(mb_hid)
             og_output = og_block.bn2(og_output)
-            if len(pruned_indices) > 0:
-                with torch.no_grad():
-                    pruned_hid = mb_hid[:, pruned_indexer, :, :]
-                    pruned_output = pruned_block.conv2(pruned_hid)
-                    pruned_output = pruned_block.bn2(pruned_output)
-                residual = residual_objective(og_output - pruned_output.detach())
+            
+            if len(pruned_indices) > 0:    
+                pruned_hid = mb_hid[:, pruned_indexer, :, :]  ## does this need to change?
+                pruned_output = pruned_block.conv2(pruned_hid)
+                pruned_output = pruned_block.bn2(pruned_output)
+                residual = residual_objective(og_output.detach() - pruned_output)
                 residual.backward()
             else:
                 residual = residual_objective(og_output)
                 residual.backward()
-
-            tmp_imp = mb_hid.grad.detach().cpu()
+            
+            try:
+                tmp_imp = pruned_block.conv2.weight.grad.detach().cpu()
+            except:
+                tmp_imp = og_block.conv2.weight.grad.detach().cpu()
+                
             with torch.no_grad():
                 tmp_imp = torch.sum(tmp_imp, dim=0)
                 if importance is None:
@@ -137,40 +158,119 @@ def prune_basic_block(input_data, og_block, ratio=0.5, num_iter=20, bs=128, verb
                     importance += tmp_imp
                 
             mb_hid.grad = None
+            pruned_block.conv2.zero_grad()
+            pruned_block.bn2.zero_grad()
             og_block.conv2.zero_grad()
             og_block.bn2.zero_grad()
 
         # find most important neurons, merge with previous active set, then threshold
         with torch.no_grad():
-            importance = torch.sum(importance, dim=(1, 2))
-            imp_idxs = torch.argsort(importance, descending=True)[:2*pruned_channels]
+            importance = torch.linalg.matrix_norm(importance)
+            imp_idxs = torch.argsort(importance, descending=True)
+            if pruned_indexer is not None:
+                mask = torch.isin(imp_idxs, pruned_indexer)
+                imp_idxs = imp_idxs[~mask][:pruned_channels]
+            else:
+                imp_idxs = imp_idxs[:pruned_channels]
             tmp_imp_channels = set(imp_idxs.cpu().tolist())
+
             bigger_set = tmp_imp_channels.union(pruned_indices)
             indexer = torch.LongTensor(sorted(list(bigger_set)))
-            hidden_sizes = agg_hidden[indexer]
-            new_pruned_indices = torch.argsort(hidden_sizes, descending=True)[:pruned_channels]
+
+        # ## STEP 3: perform grad descent of 2k model here
+        pruned_block_2k = PrunedBasicBlock(in_channels, indexer.shape[0], out_channels, weight_model = og_block, indexer=indexer)
+        pruned_block_2k = block_ft(args, og_final, pruned_block_2k, 1, args.block_ft_lr, input_data)
+
+        ## sync weights with dense model. Should be its own function
+        og_block_sync.conv1.weight.data[indexer, :] = pruned_block_2k.conv1.weight.data 
+        og_block_sync.bn1.weight.data[indexer] = pruned_block_2k.bn1.weight.data 
+        og_block_sync.bn1.bias.data[indexer] = pruned_block_2k.bn1.bias.data
+        og_block_sync.bn1.running_mean[indexer] = pruned_block_2k.bn1.running_mean.data
+
+        og_block_sync.conv2.weight.data[:, indexer, :] = pruned_block_2k.conv2.weight.data
+        og_block_sync.bn2.weight.data = pruned_block_2k.bn2.weight.data 
+        og_block_sync.bn2.bias.data = pruned_block_2k.bn2.bias.data
+
+        with torch.no_grad():
+            #replace with l2 norm of the columns of all the layers. 
+            new_pruned_imp = torch.sum(pruned_block_2k.conv2.weight.data, dim=0)
+            new_pruned_imp = torch.linalg.matrix_norm(new_pruned_imp)
+            new_pruned_indices = torch.argsort(new_pruned_imp, descending=True)[:pruned_channels]
             new_pruned_indices = set(indexer[new_pruned_indices].cpu().tolist())
             pruned_indices = new_pruned_indices
             pruned_indexer = torch.LongTensor(sorted(list(pruned_indices))).to(device)
-            pruned_block.conv1.weight.data = og_block.conv1.weight.data[pruned_indexer, :]
-            pruned_block.bn1.weight.data = og_block.bn1.weight.data[pruned_indexer]
-            pruned_block.bn1.bias.data = og_block.bn1.bias.data[pruned_indexer]
-            pruned_block.conv2.weight.data = og_block.conv2.weight.data[:, pruned_indexer, :]
-            pruned_block.bn2.weight.data = og_block.bn2.weight.data
-            pruned_block.bn2.bias.data = og_block.bn2.bias.data 
+            pruned_block.conv1.weight.data = og_block_sync.conv1.weight.data[pruned_indexer, :]
+            pruned_block.bn1.weight.data = og_block_sync.bn1.weight.data[pruned_indexer]
+            pruned_block.bn1.bias.data = og_block_sync.bn1.bias.data[pruned_indexer]
+            pruned_block.conv2.weight.data = og_block_sync.conv2.weight.data[:, pruned_indexer, :]
+            pruned_block.bn2.weight.data = og_block_sync.bn2.weight.data
+            pruned_block.bn2.bias.data = og_block_sync.bn2.bias.data 
+
+            print(new_pruned_indices)
+    
+        ## optional: perform more gd of k model here
     return pruned_block
 
 
-def run_ft(args, model, epochs, lr, criterion=None, optimizer=None, use_lr_sched=False, verbose=False):
+def block_ft(args, og_output, model, epochs, lr, input_data):
+    ## define loss function
+    criterion = torch.nn.MSELoss()
+    ## define optimizer
+    no_wd_params, wd_params = [], []
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            if ".bn" in name or '.bias' in name:
+                no_wd_params.append(param)
+            else:
+                wd_params.append(param)
+    no_wd_params = nn.ParameterList(no_wd_params)
+    wd_params = nn.ParameterList(wd_params)
+    optimizer = torch.optim.SGD([
+                                {'params': no_wd_params, 'weight_decay':0.},
+                                {'params': wd_params, 'weight_decay': args.wd},
+                            ], lr, momentum=args.momentum, nesterov=True)
+    
+    ## perform update
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    trn_losses = []
+
+    for e in range(epochs):
+        print(f'Running FT Epoch {e+1}/{epochs}')
+
+        losses = AverageMeter()
+        model = model.to(device)
+        model.train()
+        for i in range(0, input_data.shape[0], args.batch_size): 
+            inputs = input_data[i: i + args.batch_size, :]
+            inputs = inputs.to(device)
+            targets = og_output[i:i + args.batch_size, :]
+            targets.to(device)
+            
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, targets.detach())
+            loss.backward()
+            optimizer.step()
+            losses.update(loss.item(), inputs.size(0))
+        
+        trn_losses.append(losses.avg)
+        print(f'\n\nEpoch {e+1} Train Loss: {losses.avg:.5f}\n')
+    
+    return model
+
+
+
+
+def run_ft(args, model, epochs, lr, criterion=None, optimizer=None, use_lr_sched=False, verbose=True, test_only = True):
     if verbose:
         print(f'\n\nRunning FT for {epochs} epoch(s), lr {lr}, sched {use_lr_sched}')
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
-    ft_load, test_load, n_class = get_dataset_ft('imagenet', args.batch_size,
+    ft_load, test_load, n_class = get_dataset_ft('CIFAR-10', args.batch_size,
             args.workers, args.data_path)
     
     if criterion is None:
-        criterion = CrossEntropyLabelSmooth(1000).cuda()
+        criterion = CrossEntropyLabelSmooth(10).cuda()
     
     if optimizer is None:
         no_wd_params, wd_params = [], []
@@ -195,39 +295,41 @@ def run_ft(args, model, epochs, lr, criterion=None, optimizer=None, use_lr_sched
     test_losses = [tloss]
     trn_losses = []
     trn_accs = []
-    for e in range(epochs):
-        if verbose:
-            print(f'Running FT Epoch {e+1}/{epochs}')
 
-        # use cosine learning rate schedule
-        if use_lr_sched:
-            new_lr = 0.5 * lr * (1 + math.cos(math.pi * e / epochs))
-            for pg in optimizer.param_groups:
-                pg['lr'] = new_lr
+    if not test_only:
+        for e in range(epochs):
             if verbose:
-                print(f'\n\nChanging LR to: {new_lr}\n\n')
+                print(f'Running FT Epoch {e+1}/{epochs}')
 
-        losses = AverageMeter()
-        accs = AverageMeter()
-        model = model.to(device)
-        model.train()
-        for i, (inputs, targets) in enumerate(ft_load): 
-            inputs, targets = inputs.to(device), targets.to(device)
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
-            loss.backward()
-            optimizer.step()
-            prec1 = accuracy(outputs.data, targets.data, topk=(1,))[0]
-            accs.update(prec1.item(), inputs.size(0))
-            losses.update(loss.item(), inputs.size(0))
-        trn_losses.append(losses.avg)
-        trn_accs.append(accs.avg)
-        tloss, tprec1 = validate(test_load, model, criterion)
-        if verbose:
-            print(f'\n\nEpoch {e+1} Test Loss/Acc: {tloss:.2f}/{tprec1:.2f}\n')
-        test_accs.append(tprec1)
-        test_losses.append(tloss)
+            # use cosine learning rate schedule
+            if use_lr_sched:
+                new_lr = 0.5 * lr * (1 + math.cos(math.pi * e / epochs))
+                for pg in optimizer.param_groups:
+                    pg['lr'] = new_lr
+                if verbose:
+                    print(f'\n\nChanging LR to: {new_lr}\n\n')
+
+            losses = AverageMeter()
+            accs = AverageMeter()
+            model = model.to(device)
+            model.train()
+            for i, (inputs, targets) in enumerate(ft_load): 
+                inputs, targets = inputs.to(device), targets.to(device)
+                optimizer.zero_grad()
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+                loss.backward()
+                optimizer.step()
+                prec1 = accuracy(outputs.data, targets.data, topk=(1,))[0]
+                accs.update(prec1.item(), inputs.size(0))
+                losses.update(loss.item(), inputs.size(0))
+            trn_losses.append(losses.avg)
+            trn_accs.append(accs.avg)
+            tloss, tprec1 = validate(test_load, model, criterion)
+            if verbose:
+                print(f'\n\nEpoch {e+1} Test Loss/Acc: {tloss:.2f}/{tprec1:.2f}\n')
+            test_accs.append(tprec1)
+            test_losses.append(tloss)
 
     metrics = {
         'trn_accs': trn_accs,
@@ -238,19 +340,21 @@ def run_ft(args, model, epochs, lr, criterion=None, optimizer=None, use_lr_sched
     return model, metrics
 
 
-def validate(val_loader, model, criterion, verbose=False):
+def validate(val_loader, model, criterion, verbose=True):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.eval()
+    # print(model)
     losses = AverageMeter()
     top1 = AverageMeter()
     with torch.no_grad():
-        for batch_idx, (inputs, targets) in enumerate(val_loader):
-            inputs, targets = inputs.to(device), targets.to(device)
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
-            prec1 = accuracy(outputs.data, targets.data, topk=(1,))[0]
-            losses.update(loss.item(), inputs.size(0))
-            top1.update(prec1.item(), inputs.size(0))
+        inputs, targets = next(iter(val_loader))
+        inputs, targets = inputs.to(device), targets.to(device)
+        outputs = model(inputs)
+        loss = criterion(outputs, targets)
+        prec1 = accuracy(outputs.data, targets.data, topk=(1,))[0]
+        losses.update(loss.item(), inputs.size(0))
+        top1.update(prec1.item(), inputs.size(0))
+            
     if verbose:
         pruneflops, pruneparams = get_flops_and_params(model)
         print("Prune Flops, Prune Params")
@@ -264,8 +368,8 @@ def prune_rn34_imagenet():
     parser.add_argument('--save-dir', type=str, default='./results')
     parser.add_argument('--exp-name', type=str, default='ispasp_rn34_prune_00')
     parser.add_argument('--workers', type=int, default=8)
-    parser.add_argument('--data-path', type=str, default='/data')
-    parser.add_argument('--batch-size', type=int, default=256)
+    parser.add_argument('--data-path', type=str, default='data')
+    parser.add_argument('--batch-size', type=int, default=32)
     parser.add_argument('--num-cs-batches', type=int, default=5)
     parser.add_argument('--num-cs-iter', type=int, default=20)
     parser.add_argument('--layer1-ratio', type=float, default=0.4)
@@ -295,14 +399,24 @@ def prune_rn34_imagenet():
             'layer3': [],
             'layer4': [],
         }
-        prune_load, _, _ = get_dataset_ft('imagenet', args.batch_size,
+        prune_load, prune_val, _ = get_dataset_ft('CIFAR-10', args.batch_size,
                 args.workers, args.data_path)
     
-        pruned_model = torchvision.models.resnet34(pretrained=True)
+        pruned_model = torchvision.models.resnet34(weights='DEFAULT')
+        pruned_model.conv1 = torch.nn.Conv2d(3, 64, kernel_size=(3, 3), stride=(2, 2), padding=(3, 3), bias=False)
+        pruned_model.fc = torch.nn.Linear(pruned_model.fc.in_features, 10)
+        pruned_model.load_state_dict(torch.load("models/cifar10_models/state_dicts/resnet34.pt"))
         pruned_model = pruned_model.to(device)    
+
+        # code.interact(local=locals())
+        # print("pre-pruning baseline")
+        # validate(prune_val, pruned_model, CrossEntropyLabelSmooth(10).cuda())
+
+        ## train the model a little bit
 
         # prune layer1
         if args.layer1_ratio < 1.0:
+            print("pruning layer 1")
             if args.prune_last_layer:
                 max_layers = len(pruned_model.layer1)
             else:
@@ -322,7 +436,7 @@ def prune_rn34_imagenet():
                     full_prune_data = torch.cat(full_prune_data, dim=0)
 
                 assert pruned_model.layer1[i].downsample is None
-                pruned_model.layer1[i] = prune_basic_block(full_prune_data, pruned_model.layer1[i],
+                pruned_model.layer1[i] = prune_basic_block(args, full_prune_data, pruned_model.layer1[i], 
                         args.layer1_ratio, args.num_cs_iter, args.batch_size,
                         verbose=args.verbose).to(device)
                 if args.block_ft_epochs > 0:
@@ -335,6 +449,7 @@ def prune_rn34_imagenet():
          
         # prune layer2
         if args.layer2_ratio < 1.0:
+            print("pruning layer 2")
             if args.prune_last_layer:
                 max_layers = len(pruned_model.layer2)
             else:
@@ -358,7 +473,7 @@ def prune_rn34_imagenet():
 
                 # prune a residual block
                 assert pruned_model.layer2[i].downsample is None
-                pruned_model.layer2[i] = prune_basic_block(full_prune_data, pruned_model.layer2[i],
+                pruned_model.layer2[i] = prune_basic_block(args, full_prune_data, pruned_model.layer2[i],
                         args.layer2_ratio, args.num_cs_iter, args.batch_size,
                         verbose=args.verbose).to(device)
                 if args.block_ft_epochs > 0:
@@ -371,6 +486,7 @@ def prune_rn34_imagenet():
     
         # prune layer3
         if args.layer3_ratio < 1.0:
+            print("pruning layer 3")
             if args.prune_last_layer:
                 max_layers = len(pruned_model.layer3)
             else:
@@ -394,7 +510,7 @@ def prune_rn34_imagenet():
 
                 # prune a residual block
                 assert pruned_model.layer3[i].downsample is None
-                pruned_model.layer3[i] = prune_basic_block(full_prune_data, pruned_model.layer3[i],
+                pruned_model.layer3[i] = prune_basic_block(args, full_prune_data, pruned_model.layer3[i],
                         args.layer3_ratio, args.num_cs_iter, args.batch_size,
                         verbose=args.verbose).to(device) 
                 if args.block_ft_epochs > 0:
@@ -407,6 +523,7 @@ def prune_rn34_imagenet():
     
         # prune layer4
         if args.layer4_ratio < 1.0:
+            print("pruning layer 4")
             if args.prune_last_layer:
                 max_layers = len(pruned_model.layer4)
             else:
@@ -430,7 +547,7 @@ def prune_rn34_imagenet():
 
                 # prune a residual block
                 assert pruned_model.layer4[i].downsample is None
-                pruned_model.layer4[i] = prune_basic_block(full_prune_data, pruned_model.layer4[i],
+                pruned_model.layer4[i] = prune_basic_block(args, full_prune_data, pruned_model.layer4[i],
                         args.layer4_ratio, args.num_cs_iter, args.batch_size,
                         verbose=args.verbose).to(device) 
                 if args.block_ft_epochs > 0:
@@ -458,7 +575,8 @@ def prune_rn34_imagenet():
         prune_perf_mets = pre_ft_results['prune_perf_mets']
 
     if args.prune_ft_epochs > 0:
-        criterion = CrossEntropyLabelSmooth(1000).cuda()
+        print("fine-tuning")
+        criterion = CrossEntropyLabelSmooth(10).cuda()
         no_wd_params, wd_params = [], []
         for name, param in pruned_model.named_parameters():
             if param.requires_grad:
