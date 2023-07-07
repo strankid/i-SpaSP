@@ -13,10 +13,7 @@ import torchvision
 from lib.data import get_dataset_ft
 from lib.utils import accuracy, AverageMeter
 
-RANDOM_SEED = 0
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
-RNG = npr.default_rng(seed=RANDOM_SEED)
-torch.manual_seed(RANDOM_SEED)
 
 class MLP(nn.Module):
     def __init__(self, d_in=3072, d_hid=256, d_out=10):
@@ -47,48 +44,25 @@ class CrossEntropyLabelSmooth(nn.Module):
         return loss
 
 
-def residual_objective(mat):
-    return 0.5 * torch.mean(mat**2)
-
+def residual_objective(args, mat):
+    return 0.5 * torch.sum(mat**2) # using torch.sum requires small stepsize (order of 1e-5)
 
 # compute the gradient of the loss wrt the weights of the second layer
-def compute_grad(pruned_model, og_hidden, og_out, batch_size, num_batches, device):
-    grad_W = None
+def compute_grad(pruned_model, og_hidden, og_out, device):
+    with torch.no_grad():
+        U = og_out.to(device)
+        H = og_hidden.to(device)
+        W = pruned_model.fc2.weight.data
 
-    for i in range(0, og_hidden.shape[0], batch_size):
-        mb_hid = og_hidden[i:i + batch_size, :]
-        mb_hid = mb_hid.to(device)
-        og_output = og_out[i:i + batch_size, :].to(device)
-        
-        pruned_model.fc2.weight.requires_grad = True # track gradient on layer weights to determine importance
+        mat = U - H @ W.T
+        loss = 0.5 * torch.sum(mat**2)
 
-        pruned_output = pruned_model.fc2(mb_hid)
-        
-        residual = residual_objective(og_output.detach() - pruned_output) 
-        residual.backward()
-
-        with torch.no_grad():
-            U = og_output
-            H_dense = mb_hid
-            W = pruned_model.fc2.weight.data
-            dW = -1 / torch.numel(U) * (U - H_dense @ W.T).T @ H_dense
-
-        with torch.no_grad():
-            if grad_W is None:
-                grad_W = pruned_model.fc2.weight.grad.detach().cpu()
-            else:
-                grad_W += pruned_model.fc2.weight.grad.detach().cpu()
-
-        mb_hid.grad = None
-        #og_model.zero_grad()
-        pruned_model.zero_grad()
-    
-    grad_W = grad_W / num_batches
-    return grad_W
+        dW = -1 * mat.T @ H 
+    return dW, loss
 
 
 # find most important neurons, make a gradient step, then threshold
-def select_and_threshold(args, pruned_model, Q_t, grad_W, pruned_indices, d_hid_pruned, t, num_iter, device):
+def select_and_threshold(args, pruned_model, Q_t, grad_W, og_hidden, pruned_indices, d_hid_pruned, t, num_iter, device):
     with torch.no_grad():
         grad_W = grad_W.to(device)
 
@@ -110,12 +84,13 @@ def select_and_threshold(args, pruned_model, Q_t, grad_W, pruned_indices, d_hid_
                 dW_at_D_t[:, index] = grad_W[:, index]
                 Q_t_at_D_t[:, index] = Q_t[:, index]
 
-        # update W_t by gradient descent focused on D_t
-        Q_t_at_D_t = Q_t_at_D_t - args.lr * dW_at_D_t
-
+        og_hidden = og_hidden.to(device)
+        lr = args.lr
         if args.use_lr_sched:
-            args.lr = 0.5 * args.lr * (1 + math.cos(math.pi * t / num_iter))
-            print(f'new lr: {args.lr}')
+            lr = torch.norm(dW_at_D_t) ** 2 / torch.norm(og_hidden @ dW_at_D_t.T) ** 2
+
+        # update W_t by gradient descent focused on D_t
+        Q_t_at_D_t = Q_t_at_D_t - lr * dW_at_D_t
 
         for index in range(Q_t.shape[1]):
             if index in D_t:
@@ -183,6 +158,7 @@ def prune_hidden_neurons(args, input_data, og_model, ratio=0.5, num_iter=20, bs=
         og_output = torch.cat(og_output, dim=0)
 
     # choose random pruned indices to start
+    RNG = npr.default_rng(seed=args.random_seed)
     random_indices = RNG.choice(int(pruned_model.fc2.weight.data.shape[1]), d_hid_pruned, replace=False)
     pruned_indices = set(random_indices)
     pruned_indexer = torch.LongTensor(sorted(list(pruned_indices))).to(device) 
@@ -193,16 +169,19 @@ def prune_hidden_neurons(args, input_data, og_model, ratio=0.5, num_iter=20, bs=
             if index not in pruned_indices:
                 pruned_model.fc2.weight.data[:, index] = torch.zeros_like(pruned_model.fc2.weight.data[:, index]) # truncate W_t to top s neurons
 
+    training_losses = []
+    testing_accs = []
     for t in range(num_iter):
         # compute validation accuracy of current model
+        tprec1 = None
         if val_data is not None:
             with torch.no_grad():
                 criterion = CrossEntropyLabelSmooth(10).cuda()                                                                                                                 
-                tloss, tprec1 = validate(val_data, pruned_model, criterion)            
+                tloss, tprec1 = validate(val_data, pruned_model, criterion)     
                 print(f'Pruning, epoch {t}: loss = {tloss}, acc = {tprec1}')
 
-        grad_W = compute_grad(pruned_model, og_hidden, og_output, bs, args.num_cs_batches, device)
-        Q_t, pruned_indices, pruned_indexer = select_and_threshold(args, pruned_model, Q_t, grad_W, pruned_indices, d_hid_pruned, t, num_iter, device)
+        grad_W, residual = compute_grad(pruned_model, og_hidden, og_output, device)
+        Q_t, pruned_indices, pruned_indexer = select_and_threshold(args, pruned_model, Q_t, grad_W, og_hidden, pruned_indices, d_hid_pruned, t, num_iter, device)
         
         # update pruned_block with new pruned indices and new weights for conv2
         with torch.no_grad(): 
@@ -212,7 +191,7 @@ def prune_hidden_neurons(args, input_data, og_model, ratio=0.5, num_iter=20, bs=
                     pruned_model.fc2.weight.data[:, index] = torch.zeros_like(pruned_model.fc2.weight.data[:, index]) # truncate W_t to top s neurons
 
         for e in range(gd_iters):
-            grad_W = compute_grad(pruned_model, og_hidden, og_output, bs, args.num_cs_batches, device)
+            grad_W, _ = compute_grad(pruned_model, og_hidden, og_output, device)
             grad_W = grad_W.to(device)
 
             # zero out grads corresponding to pruned neurons
@@ -221,99 +200,30 @@ def prune_hidden_neurons(args, input_data, og_model, ratio=0.5, num_iter=20, bs=
                 if index in pruned_indices:
                     dW_at_S_t[:, index] = grad_W[:, index]
 
-            # make a gradient step
-            Q_t = Q_t - args.ft_lr * dW_at_S_t
+            # choose a learning rate
+            og_hidden = og_hidden.to(device)
+            ft_lr = args.ft_lr
+            if args.use_lr_sched:
+                ft_lr = torch.norm(dW_at_S_t) ** 2 / torch.norm(og_hidden @ dW_at_S_t.T) ** 2
 
-            # update pruned_model
+            # make a gradient step
+            Q_t = Q_t - ft_lr * dW_at_S_t
+
+            # # update pruned_model
             pruned_model.fc2.weight.data[:, pruned_indexer] = Q_t[:, pruned_indexer]
+
+        if tprec1 is not None:
+            testing_accs.append(tprec1)
+        training_losses.append(residual)
 
     # create a new pruned block that only contains the pruned indices
     final_pruned_block = MLP(d_in, d_hid_pruned, d_out)
     final_pruned_block = final_pruned_block.to(device)
 
-    final_pruned_block.fc1.weight.data =  pruned_model.fc1.weight.data[pruned_indexer, :]
+    final_pruned_block.fc1.weight.data = pruned_model.fc1.weight.data[pruned_indexer, :]
     final_pruned_block.fc2.weight.data = pruned_model.fc2.weight.data[:, pruned_indexer]
 
-    return final_pruned_block
-
-
-def run_ft(args, model, epochs, lr, criterion=None, optimizer=None, use_lr_sched=False, verbose=False):
-    if verbose:
-        print(f'\n\nRunning FT for {epochs} epoch(s), lr {lr}, sched {use_lr_sched}')
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = model.to(device)
-    ft_load, test_load, n_class = get_dataset_ft(args.dataset, args.batch_size,
-            args.workers, args.data_path)
-    
-    if criterion is None:
-        criterion = CrossEntropyLabelSmooth(10).cuda()
-    
-    if optimizer is None:
-        no_wd_params, wd_params = [], []
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                if ".bn" in name or '.bias' in name:
-                    no_wd_params.append(param)
-                else:
-                    wd_params.append(param)
-        no_wd_params = nn.ParameterList(no_wd_params)
-        wd_params = nn.ParameterList(wd_params)
-        optimizer = torch.optim.SGD([
-                                    {'params': no_wd_params, 'weight_decay':0.},
-                                    {'params': wd_params, 'weight_decay': args.wd},
-                                ], lr, momentum=args.momentum, nesterov=True)
-    
-    tloss, tprec1 = validate(test_load, model, criterion, verbose=True)
-    if verbose:
-        print(f'Epoch 0 Test Loss/Acc: {tloss:.2f}/{tprec1:.2f}')
-
-    test_accs = [tprec1]
-    test_losses = [tloss]
-    trn_losses = []
-    trn_accs = []
-    for e in range(epochs):
-        if verbose:
-            print(f'Running FT Epoch {e+1}/{epochs}')
-
-        # use cosine learning rate schedule
-        if use_lr_sched:
-            new_lr = 0.5 * lr * (1 + math.cos(math.pi * e / epochs))
-            for pg in optimizer.param_groups:
-                pg['lr'] = new_lr
-            if verbose:
-                print(f'\n\nChanging LR to: {new_lr}\n\n')
-
-        losses = AverageMeter()
-        accs = AverageMeter()
-        model = model.to(device)
-        model.train()
-        for i, (inputs, targets) in enumerate(ft_load): 
-            inputs, targets = inputs.to(device), targets.to(device)
-            inputs = inputs.flatten(start_dim=1)
-
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
-            loss.backward()
-            optimizer.step()
-            prec1 = accuracy(outputs.data, targets.data, topk=(1,))[0]
-            accs.update(prec1.item(), inputs.size(0))
-            losses.update(loss.item(), inputs.size(0))
-        trn_losses.append(losses.avg)
-        trn_accs.append(accs.avg)
-        tloss, tprec1 = validate(test_load, model, criterion)
-        if verbose:
-            print(f'\n\nEpoch {e+1} Test Loss/Acc: {tloss:.2f}/{tprec1:.2f}\n')
-        test_accs.append(tprec1)
-        test_losses.append(tloss)
-
-    metrics = {
-        'trn_accs': trn_accs,
-        'trn_losses': trn_losses,
-        'test_accs': test_accs,
-        'test_losses': test_losses,
-    }
-    return model, metrics
+    return final_pruned_block, training_losses, testing_accs, pruned_indices
 
 
 def validate(val_loader, model, criterion, verbose=False):
@@ -336,7 +246,6 @@ def validate(val_loader, model, criterion, verbose=False):
      
 
 def prune_mlp():
-    print(f'random seed: {RANDOM_SEED}')
     parser = argparse.ArgumentParser(description='prune + train for mlp')
     parser.add_argument('--save-dir', type=str, default='./results')
     parser.add_argument('--exp-name', type=str, default='prutra_mlp_00')
@@ -357,16 +266,19 @@ def prune_mlp():
     parser.add_argument('--lr', type=float, default=1e-2)
     parser.add_argument('--model-path', type=str, default='./models_cifar10/state_dicts/cifar_net.pth')
     parser.add_argument('--extra-epochs', type=int, default=0)
+    parser.add_argument('--random-seed', type=int, default=0)
 
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')   
+    torch.manual_seed(args.random_seed)
+    print(f'random seed: {args.random_seed}')
 
     if args.pruned_path is None:
         # prune the hidden layer of a 2-layer MLP with Pruning+Training based on pre-defined ratios
 
         prune_load, val_load, _ = get_dataset_ft(args.dataset, args.batch_size,
-                    args.workers, args.data_path)
+                    args.workers, args.data_path, extra_transforms=False)
         
         assert args.dataset == 'CIFAR-10'
 
@@ -390,16 +302,25 @@ def prune_mlp():
                     full_prune_data.append(tmp_prune_data.cpu())
                 full_prune_data = torch.cat(full_prune_data, dim=0)
 
-            pruned_model = prune_hidden_neurons(args, full_prune_data, model,
+            pruned_model, training_losses, testing_accs, pruned_indices = prune_hidden_neurons(args, full_prune_data, model,
                     args.pruning_ratio, args.num_cs_iter, args.batch_size, gd_iters=args.extra_epochs,
-                    verbose=args.verbose, val_data=val_load).to(device)
+                    verbose=args.verbose, val_data=val_load)
             
+            pruned_model = pruned_model.to(device)
+ 
         else:
             print('No pruning done, using full model')
+
+        criterion = CrossEntropyLabelSmooth(10).cuda()                                                                                                                 
+        tloss, tprec1 = validate(val_load, pruned_model, criterion)            
+        print(f'Post-pruning: loss = {tloss}, acc = {tprec1}')
             
         pre_ft_results = {
             'model': pruned_model.cpu(),
             'args': args,
+            'training_losses': training_losses, 
+            'testing_accs': testing_accs,
+            'final_pruned_indices': pruned_indices
         }
         if not os.path.exists(args.save_dir):
             os.mkdir(args.save_dir)
@@ -409,37 +330,6 @@ def prune_mlp():
         pre_ft_results = torch.load(args.pruned_path)
         pruned_model = pre_ft_results['model']
         prune_perf_mets = pre_ft_results['prune_perf_mets']
-
-    if args.ft_epochs > 0:
-        criterion = CrossEntropyLabelSmooth(10).cuda()
-        no_wd_params, wd_params = [], []
-        for name, param in pruned_model.named_parameters():
-            if param.requires_grad:
-                if ".bn" in name or '.bias' in name:
-                    no_wd_params.append(param)
-                else:
-                    wd_params.append(param)
-        no_wd_params = nn.ParameterList(no_wd_params)
-        wd_params = nn.ParameterList(wd_params)
-        optimizer = torch.optim.SGD([
-	        {'params': no_wd_params, 'weight_decay': 0.},
-		    {'params': wd_params, 'weight_decay': args.wd},
-        ], args.ft_lr, momentum=args.momentum, nesterov=True)
-
-        # run final fine tuning and find metrics
-        pruned_model, metrics = run_ft(args, pruned_model, args.ft_epochs, args.ft_lr,
-            criterion=criterion, optimizer=optimizer, use_lr_sched=args.use_lr_sched, verbose=args.verbose)
-
-        # save the results
-        all_results = {
-            'model': pruned_model.cpu(),
-            'perf_mets': metrics,
-            'args': args,
-        }
-        if not os.path.exists(args.save_dir):
-            os.mkdir(args.save_dir)
-        torch.save(all_results, os.path.join(args.save_dir, f'{args.exp_name}.pth'))
-
 
 if __name__=='__main__':
     prune_mlp()
