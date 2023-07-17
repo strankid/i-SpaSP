@@ -13,6 +13,8 @@ import torchvision
 from lib.data import get_dataset_ft
 from lib.utils import accuracy, AverageMeter
 
+from baselineModels.SparseGPT import SparseGPT
+
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 
 class MLP(nn.Module):
@@ -243,6 +245,22 @@ def validate(val_loader, model, criterion, verbose=False):
     if verbose:
         print(f'Test Acc.: {top1.avg:.4f}')
     return losses.avg, top1.avg
+
+def pruneSparseGPT(model, trainloader, sparsity=0.5, blocksize=8):
+    inp1, _ = next(iter(trainloader))
+    inp1 = inp1.to(device)
+    inp1 = inp1.flatten(start_dim=1)
+
+    out1 = model.fc1(inp1)
+    sparseLayer1 = SparseGPT(model.fc1)
+    sparseLayer1.add_batch(inp1, out1)
+    sparseLayer1.fasterprune(sparsity, blocksize=blocksize)
+    
+    inp2 = model.activation(out1)
+    out2 = model.fc2(inp2)
+    sparseLayer2 = SparseGPT(model.fc2)
+    sparseLayer2.add_batch(inp2, out2)
+    sparseLayer2.fasterprune(sparsity, blocksize=blocksize)
      
 
 def prune_mlp():
@@ -267,9 +285,11 @@ def prune_mlp():
     parser.add_argument('--model-path', type=str, default='./models_cifar10/state_dicts/cifar_net.pth')
     parser.add_argument('--extra-epochs', type=int, default=0)
     parser.add_argument('--random-seed', type=int, default=0)
+    parser.add_argument('--prune-method', type=str, default="main")
 
     args = parser.parse_args()
 
+    global device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')   
     torch.manual_seed(args.random_seed)
     print(f'random seed: {args.random_seed}')
@@ -285,14 +305,18 @@ def prune_mlp():
         model = MLP(d_hid=256)
         state_dict = torch.load(SCRIPT_DIR + "/models_cifar10/state_dicts/" + args.model_path)
         model.load_state_dict(state_dict)
-        model = model.to(device)    
+        model = model.to(device)  
         
         criterion = CrossEntropyLabelSmooth(10).cuda()                                                                                                                 
         tloss, tprec1 = validate(val_load, model, criterion)            
         print(f'Pre-pruning: loss = {tloss}, acc = {tprec1}')
 
+        if args.prune_method == "SparseGPT":
+            pruned_model = deepcopy(model)
+            pruneSparseGPT(pruned_model, trainloader=prune_load, sparsity= 1 - args.pruning_ratio)
+
         # prune hidden layer
-        if args.pruning_ratio < 1.0:
+        elif args.prune_method == "main" and args.pruning_ratio < 1.0:
             with torch.no_grad():
                 full_prune_data = []
                 data_iter = iter(prune_load)
