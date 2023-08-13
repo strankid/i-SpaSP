@@ -572,11 +572,8 @@ def prune_layer_ispasp(blay, hidden_states_list, mask_list, num_iter=10, prune_r
       attn_mask = attn_mask.to(device)
       hidden_states = hidden_states.to(device)
 
-      _, weights = blay.attention(hidden_states, attn_mask, head_mask=None, output_attentions=True)
-
-      v = shape(blay.attention.self.value(hidden_states))
-      context = torch.matmul(weights, v)
-
+      context = blay.attention.self(hidden_states, attn_mask, head_mask=None, output_attentions=False)[0]
+      context = shape(context)
       context = context.permute(0, 2, 1, 3).contiguous()
       # satt_out = unshape(context)
 
@@ -856,6 +853,7 @@ def prune_attn_layer(args, layer, hidden_states_list, mask_list, val_arguments, 
 
   n_heads_to_keep = int(layer.self.num_attention_heads * prune_ratio)
 
+  
   def shape(x):
     """separate heads"""
     return x.view(x.shape[0], -1, layer.self.num_attention_heads, layer.self.attention_head_size).transpose(1, 2)
@@ -882,13 +880,8 @@ def prune_attn_layer(args, layer, hidden_states_list, mask_list, val_arguments, 
       attn_mask = attn_mask.to(device)
       hidden_states = hidden_states.to(device)
 
-      _, weights = layer(hidden_states, attn_mask, head_mask=None, output_attentions=True)
-
-      v = shape(layer.self.value(hidden_states))
-      context = torch.matmul(weights, v)
-
-      H = unshape(context)
-      h = torch.norm(context, p=2, dim=(0, 2, 3))
+      H  = layer.self(hidden_states, attn_mask, head_mask=None, output_attentions=False)[0]
+      h = torch.norm(shape(H), p=2, dim=(0, 2, 3))
 
   for t in range(args.iters):
     if args.validate_iter:
