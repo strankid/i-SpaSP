@@ -169,7 +169,7 @@ def compute_grads(args, dense_out_lin, pruned_out_lin, H, weight_indexer, device
 
   loss.backward()
 
-  dW = dense_out_lin.weight.grad
+  dW = deepcopy(dense_out_lin.weight.grad)
 
   # maybe instead of using attn grad, should aggregate parameter grads? either for weights only or for all
   pruned_out_lin.zero_grad()
@@ -207,6 +207,7 @@ def update_step(args, Q, dW_dense, weight_indexer, H, device=None):
     eta = args.eta
     if args.eta == 'adaptive':
       eta = torch.norm(dW_pruned) ** 2 / torch.norm(H[:, :, weight_indexer] @ dW_pruned.T) ** 2
+
     Q[:, weight_indexer] = Q[:, weight_indexer] - eta * dW_pruned
 
   return Q
@@ -905,7 +906,7 @@ def prune_attn_layer(args, layer, hidden_states_list, mask_list, val_arguments, 
   all_heads = set(range(layer.self.num_attention_heads))
 
   layer.prune_heads(all_heads.difference(S))
-  # layer.out_lin = pruned_out_lin
+  layer.out_lin = pruned_out_lin
 
   if layer_id is not None:
     print(f'Done pruning layer {layer_id}')
